@@ -2,7 +2,7 @@
 	"type": "module",
 	"name": "@oh-my-pi/telegram-gateway",
 	"version": "1.0.0",
-	"description": "Telegram + Email gateway for pi-247 agent. Relays messages between chat platforms and pi-247 SDK.",
+	"description": "Telegram gateway for pi-247 agent.",
 	"license": "MIT",
 	"main": "./src/index.ts",
 	"types": "./src/index.ts",
@@ -19,13 +19,10 @@
 		"@oh-my-pi/pi-coding-agent": "catalog:",
 		"@oh-my-pi/pi-utils": "catalog:",
 		"@oh-my-pi/pi-ai": "catalog:",
-		"grammy": "^1.34.0",
-		"imapflow": "^1.0.179",
-		"nodemailer": "^7.0.0"
+		"grammy": "^1.34.0"
 	},
 	"devDependencies": {
-		"@types/bun": "catalog:",
-		"@types/nodemailer": "^6.4.17"
+		"@types/bun": "catalog:"
 	},
 	"engines": {
 		"bun": ">=1.3.7"

@@ -22,7 +22,6 @@ bun packages/telegram-gateway/src/index.ts
 | `GATEWAY_SESSION_DIR` | No | auto | Session persistence directory |
 | `GATEWAY_AGENT_DIR` | No | `~/.omp/pi-gateway` | Config dir (isolated from omp/Claude Code) |
 
-### Email (optional)
 
 Set `EMAIL_IMAP_HOST` to enable email listener.
 

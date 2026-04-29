@@ -48,6 +48,10 @@ compaction-results/
 changes/
 __pycache__/
 
+# Agent workspace
+/workspace/*
+!/workspace/README.md
+
 # Scratch files
 syntax.jsonl
 out.jsonl
