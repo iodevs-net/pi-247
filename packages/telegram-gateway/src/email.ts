@@ -2,10 +2,11 @@ import { ImapFlow } from "imapflow";
 import nodemailer from "nodemailer";
 import type { AgentClient } from "./agent-client";
 import type { EmailConfig } from "./config";
+import { withRetry } from "./retry";
 import { debug, log, error as logError } from "./debug";
 
 /**
- * Email adapter. Listens for new emails via IMAP IDLE,
+ * Email adapter. Listens for new emails via IMAP polling,
  * relays to pi-247 agent, sends responses via SMTP.
  */
 export class EmailListener {
@@ -15,6 +16,8 @@ export class EmailListener {
 	private transporter: nodemailer.Transporter;
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private seenUids: Set<number> = new Set();
+	private stopped = false;
+	private imapConnected = false;
 
 	constructor(config: EmailConfig, agent: AgentClient) {
 		this.config = config;
@@ -38,17 +41,37 @@ export class EmailListener {
 
 	async start(): Promise<void> {
 		log("email", "connecting IMAP %s:%d", this.config.imapHost, this.config.imapPort);
-		await this.imap.connect();
+		await this.connectImap();
 		log("email", "IMAP connected");
 
-		// Initial sync of seen UIDs
 		debug("email", "syncing seen UIDs");
 		await this.syncSeenUids();
 
-		// Poll for new emails
 		const interval = this.config.checkIntervalMs;
 		log("email", "polling every %dms", interval);
 		this.interval = setInterval(() => this.checkMail(), interval);
+	}
+
+	private async connectImap(): Promise<void> {
+		await withRetry(() => this.imap.connect(), {
+			maxAttempts: 5,
+			baseMs: 2000,
+		});
+		this.imapConnected = true;
+		this.imap.on("close", () => { this.imapConnected = false; });
+	}
+
+	private async ensureImapConnected(): Promise<void> {
+		if (this.imapConnected && this.imap.usable) return;
+		debug("email", "IMAP not connected, reconnecting");
+		this.imap = new ImapFlow({
+			host: this.config.imapHost,
+			port: this.config.imapPort,
+			secure: this.config.imapSecure,
+			auth: { user: this.config.imapUser, pass: this.config.imapPass },
+			logger: false,
+		});
+		await this.connectImap();
 	}
 
 	private async syncSeenUids(): Promise<void> {
@@ -70,7 +93,10 @@ export class EmailListener {
 	}
 
 	private async checkMail(): Promise<void> {
+		if (this.stopped) return;
 		try {
+			await this.ensureImapConnected();
+
 			const lock = await this.imap.getMailboxLock("INBOX");
 			try {
 				const status = await this.imap.status("INBOX", { unseen: true });
@@ -92,6 +118,9 @@ export class EmailListener {
 					const subject = msg.envelope?.subject ?? "(no subject)";
 					const body = await this.extractText(msg);
 					if (!body?.trim()) continue;
+					if (body.length > 50000) {
+						debug("email", "body truncated from %d to 50000 chars", body.length);
+					}
 
 					const promptText = `[Email from ${senderAddr}]\nSubject: ${subject}\n\n${body}`;
 					log("email", "processing from %s: %s", senderAddr, subject);
@@ -100,12 +129,15 @@ export class EmailListener {
 					const reply = result.text.trim() || "(no response)";
 					debug("email", "response len=%d partial=%s", reply.length, result.partial);
 
-					await this.transporter.sendMail({
-						from: this.config.smtpUser,
-						to: from.address,
-						subject: `Re: ${subject}`,
-						text: reply,
-					});
+					await withRetry(() =>
+						this.transporter.sendMail({
+							from: this.config.smtpUser,
+							to: from.address,
+							subject: `Re: ${subject}`,
+							text: reply,
+						}),
+						{ maxAttempts: 3, baseMs: 1000 },
+					);
 					log("email", "replied to %s", senderAddr);
 				}
 			} finally {
@@ -127,9 +159,10 @@ export class EmailListener {
 	}
 
 	async stop(): Promise<void> {
+		this.stopped = true;
 		log("email", "stopping");
 		if (this.interval) clearInterval(this.interval);
-		await this.imap.logout();
+		try { await this.imap.logout(); } catch { /* ignore */ }
 		this.transporter.close();
 	}
 }

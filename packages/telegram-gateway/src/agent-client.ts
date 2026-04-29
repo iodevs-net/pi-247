@@ -12,6 +12,9 @@ interface QueueItem {
 	reject: (err: unknown) => void;
 }
 
+const PROMPT_TIMEOUT_MS = parseInt(process.env.GATEWAY_PROMPT_TIMEOUT ?? "120000", 10);
+const MAX_QUEUE_SIZE = parseInt(process.env.GATEWAY_MAX_QUEUE ?? "20", 10);
+
 const TELEGRAM_SYSTEM_PROMPT_SUFFIX = `
 
 ## Telegram Communication Rules
@@ -68,6 +71,11 @@ export class AgentClient {
 
 		// If already processing a message, queue and return a promise
 		if (this.processing) {
+			if (this.queue.length >= MAX_QUEUE_SIZE) {
+				const err = new Error(`Queue full (max ${MAX_QUEUE_SIZE}). Try again later.`);
+				debug("queue", "QUEUE FULL: %s", preview);
+				throw err;
+			}
 			debug("queue", "QUEUE +%d: %s", this.queue.length + 1, preview);
 			return new Promise((resolve, reject) => {
 				this.queue.push({ text, resolve, reject });
@@ -91,12 +99,20 @@ export class AgentClient {
 
 	private async runPrompt(text: string): Promise<PromptResult> {
 		const session = this.session!;
-		return new Promise((resolve, reject) => {
+
+		return new Promise<PromptResult>((resolve, reject) => {
 			const parts: string[] = [];
 			let partial = false;
 			let toolUsePending = false;
+			let settled = false;
+
+			const timer = setTimeout(() => {
+				settled = true;
+				reject(new Error(`Prompt timed out after ${PROMPT_TIMEOUT_MS / 1000}s`));
+			}, PROMPT_TIMEOUT_MS);
 
 			const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+				if (settled) return;
 				debug("agent", "EVENT: type=%s", event.type);
 
 				if (event.type === "message_update" && "assistantMessageEvent" in event) {
@@ -139,12 +155,16 @@ export class AgentClient {
 					}
 					const totalLen = parts.join("").length;
 					debug("agent", "TURN_END: response=%d chars partial=%s", totalLen, partial);
+					clearTimeout(timer);
 					unsubscribe();
 					resolve({ text: parts.join("").trim(), partial });
 				}
 			});
 
 			session.prompt(text).catch((err: unknown) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
 				unsubscribe();
 				reject(err);
 			});

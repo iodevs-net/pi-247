@@ -1,5 +1,8 @@
-import { Bot, type Context } from "grammy";
+import { Bot, type Context, GrammyError } from "grammy";
 import type { AgentClient } from "./agent-client";
+import { RateLimiter } from "./rate-limiter";
+import { withRetry } from "./retry";
+import { splitMarkdown } from "./splitter";
 import { debug, log, error as logError } from "./debug";
 
 export interface TelegramConfig {
@@ -7,10 +10,15 @@ export interface TelegramConfig {
 	allowedUsers: string[];
 }
 
+const RATE_LIMIT = parseInt(process.env.GATEWAY_RATE_LIMIT ?? "10", 10);
+const MAX_MSG_LEN = 4000;
+
 export class TelegramBot {
 	private bot: Bot;
 	private agent: AgentClient;
 	private config: TelegramConfig;
+	private rateLimiter = new RateLimiter({ maxRequests: RATE_LIMIT });
+	private stopped = false;
 
 	constructor(config: TelegramConfig, agent: AgentClient) {
 		this.config = config;
@@ -43,6 +51,12 @@ export class TelegramBot {
 			if (!isAllowed(ctx, this.config.allowedUsers)) return;
 			const text = ctx.message.text.trim();
 			if (!text) return;
+			const userId = String(ctx.from?.id ?? "?");
+			if (!this.rateLimiter.allow(userId)) {
+				debug("telegram", "rate limited user=%s", userId);
+				await ctx.reply("⏳ Too many requests. Slow down.");
+				return;
+			}
 			await handleMessage(ctx, this.agent);
 		});
 	}
@@ -50,22 +64,52 @@ export class TelegramBot {
 	async start(): Promise<void> {
 		const me = await this.bot.api.getMe();
 		log("telegram", "bot connected: @%s (id=%s)", me.username ?? "?", me.id);
-		debug("telegram", "starting bot long-polling");
-		await this.bot.start({ drop_pending_updates: true });
+		await this.startPolling();
+	}
+
+	private async startPolling(): Promise<void> {
+		while (!this.stopped) {
+			debug("telegram", "starting long-polling");
+			try {
+				await withRetry(() => this.bot.start({ drop_pending_updates: true }), {
+					maxAttempts: 3,
+					baseMs: 2000,
+					isRetryable: (err) => {
+						if (err instanceof GrammyError) {
+							return err.error_code >= 500 || err.error_code === 429;
+						}
+						return true;
+					},
+				});
+				break; // exited cleanly via bot.stop()
+			} catch (err) {
+				if (this.stopped) break;
+				logError("telegram", "polling failed, reconnecting in 10s", err);
+				await sleep(10_000);
+			}
+		}
 	}
 
 	async stop(): Promise<void> {
+		this.stopped = true;
 		debug("telegram", "stopping bot");
 		await this.bot.stop();
 		log("telegram", "bot stopped");
 	}
 }
 
-// ── Message handler ──────────────────────────────────────────────────────────
+// -- Message handler ---------------------------------------------------------------
 
 async function handleMessage(ctx: Context, agent: AgentClient): Promise<void> {
 	const chatId = ctx.chat!.id;
-	const text = ctx.message!.text!.trim();
+	let text = ctx.message!.text!.trim();
+	if (!text) return;
+	if (text.length > MAX_MSG_LEN) {
+		debug("telegram", "msg truncated from %d to %d chars", text.length, MAX_MSG_LEN);
+		text = text.slice(0, MAX_MSG_LEN);
+	}
+	text = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+
 	const preview = text.length > 60 ? text.slice(0, 60) + "..." : text;
 	log("telegram", "msg from=%s: %s", ctx.from?.username ?? ctx.from?.id ?? "?", preview);
 
@@ -89,8 +133,13 @@ async function handleMessage(ctx: Context, agent: AgentClient): Promise<void> {
 		const result = await agent.prompt(text);
 		const reply = result.text || "(no response)";
 		debug("telegram", "response len=%d partial=%s", reply.length, result.partial);
-		for (const chunk of splitMessage(reply, 4000)) {
-			await ctx.reply(chunk, { parse_mode: "Markdown" });
+		for (const chunk of splitMarkdown(reply, 4000)) {
+			try {
+				await ctx.reply(chunk, { parse_mode: "Markdown" });
+			} catch {
+				debug("telegram", "Markdown parse failed, sending as plain text");
+				await ctx.reply(stripMarkdown(chunk));
+			}
 		}
 		debug("telegram", "response sent (%d chunks)", Math.ceil(reply.length / 4000));
 	} catch (err: unknown) {
@@ -104,7 +153,7 @@ async function handleMessage(ctx: Context, agent: AgentClient): Promise<void> {
 	}
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- Helpers ------------------------------------------------------------------------
 
 function isAllowed(ctx: Context, users: string[]): boolean {
 	if (users.includes("*")) return true;
@@ -113,11 +162,15 @@ function isAllowed(ctx: Context, users: string[]): boolean {
 	return users.includes(id) || users.includes(`@${un}`);
 }
 
-function splitMessage(text: string, max: number): string[] {
-	if (text.length <= max) return [text];
-	const chunks: string[] = [];
-	for (let i = 0; i < text.length; i += max) chunks.push(text.slice(i, i + max));
-	return chunks;
+function stripMarkdown(text: string): string {
+	return text
+		.replace(/\*([^*]+)\*/g, "$1")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/```[\s\S]*?```/g, "")
+		.replace(/__([^_]+)__/g, "$1")
+		.replace(/~~([^~]+)~~/g, "$1")
+		.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+		.trim();
 }
 
 function sleep(ms: number): Promise<void> {
