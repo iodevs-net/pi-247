@@ -117,7 +117,9 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		//     redacted/encrypted reasoning into DeepSeek's plaintext form, so cross-provider continuations
 		//     rely on a placeholder — see `convertMessages` for the placeholder injection.
 		requiresReasoningContentForToolCalls:
-			isKimiModel || ((provider === "openrouter" || baseUrl.includes("openrouter.ai")) && Boolean(model.reasoning)),
+			isKimiModel ||
+			(provider === "deepseek" && Boolean(model.reasoning)) ||
+			((provider === "openrouter" || baseUrl.includes("openrouter.ai")) && Boolean(model.reasoning)),
 		requiresAssistantContentForToolCalls: isKimiModel,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,
