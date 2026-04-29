@@ -91,9 +91,9 @@ export class AgentClient {
 		if (agentDir) {
 			opts.agentDir = agentDir;
 		}
-		if (sessionDir) {
-			opts.sessionManager = await SessionManager.continueRecent(cwd, sessionDir);
-		}
+		// Always persist sessions — derive default from agentDir if not configured
+		const resolvedDir = sessionDir ?? (agentDir ? path.join(agentDir, "sessions") : undefined);
+		opts.sessionManager = await SessionManager.continueRecent(cwd, resolvedDir);
 		opts.systemPrompt = buildSystemPrompt(cwd);
 
 		const settings = await Settings.init({ cwd, agentDir: agentDir ?? undefined });
