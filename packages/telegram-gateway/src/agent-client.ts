@@ -40,11 +40,14 @@ export class AgentClient {
 		return this.processing;
 	}
 
-	async init(cwd: string, sessionDir: string | null): Promise<void> {
+	async init(cwd: string, sessionDir: string | null, agentDir?: string): Promise<void> {
 		log("agent", "starting pi-247 session (cwd=%s)", cwd);
-		debug("agent", "init with sessionDir=%s", sessionDir ?? "null");
+		debug("agent", "init with sessionDir=%s agentDir=%s", sessionDir ?? "null", agentDir ?? "default");
 
 		const opts: Record<string, unknown> = { cwd };
+		if (agentDir) {
+			opts.agentDir = agentDir;
+		}
 		if (sessionDir) {
 			opts.sessionManager = await SessionManager.continueRecent(cwd, sessionDir);
 		}

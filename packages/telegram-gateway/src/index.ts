@@ -36,7 +36,7 @@ async function main(): Promise<void> {
 
 	// ── Start pi-247 agent session ──────────────────────────────────────────
 	const agent = new AgentClient();
-	await agent.init(config.agentCwd, config.sessionDir);
+	await agent.init(config.agentCwd, config.sessionDir, config.agentDir);
 	log("gateway", "pi-247 agent ready");
 
 	// ── Start Telegram bot ──────────────────────────────────────────────────

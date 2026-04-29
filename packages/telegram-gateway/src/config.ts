@@ -1,3 +1,6 @@
+import path from "path";
+import os from "os";
+
 export interface GatewayConfig {
 	telegramToken: string;
 	email: EmailConfig | null;
@@ -5,6 +8,8 @@ export interface GatewayConfig {
 	agentCwd: string;
 	/** Session persistence dir for pi-247 */
 	sessionDir: string | null;
+	/** Agent config dir (~/.omp/agent by default). Isolated from omp/Claude Code. */
+	agentDir: string;
 }
 
 export interface EmailConfig {
@@ -67,12 +72,15 @@ export function loadConfig(): GatewayConfig {
 	const allowedUsers = allowedRaw === "*" ? ["*"] : allowedRaw.split(",").map(s => s.trim()).filter(Boolean);
 	const emailSection = loadEmailConfig();
 
+	const defaultAgentDir = path.join(os.homedir(), ".omp", "pi-gateway");
+
 	return {
 		telegramToken: tgToken,
 		email: emailSection,
 		allowedUsers,
 		agentCwd: process.env.GATEWAY_AGENT_CWD ?? process.cwd(),
 		sessionDir: process.env.GATEWAY_SESSION_DIR ?? null,
+		agentDir: process.env.GATEWAY_AGENT_DIR ?? defaultAgentDir,
 	};
 }
 

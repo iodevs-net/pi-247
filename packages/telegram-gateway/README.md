@@ -20,6 +20,7 @@ bun packages/telegram-gateway/src/index.ts
 | `GATEWAY_ALLOWED_USERS` | No | `*` | Comma-separated Telegram user IDs |
 | `GATEWAY_AGENT_CWD` | No | `cwd` | Working directory for pi-247 |
 | `GATEWAY_SESSION_DIR` | No | auto | Session persistence directory |
+| `GATEWAY_AGENT_DIR` | No | `~/.omp/pi-gateway` | Config dir (isolated from omp/Claude Code) |
 
 ### Email (optional)
 
