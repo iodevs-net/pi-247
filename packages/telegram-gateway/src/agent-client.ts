@@ -1,6 +1,7 @@
 import path from "path";
 import { createAgentSession, SessionManager, type AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent";
 import { debug, log } from "./debug";
+import { detectToolLoop, stableStringify } from "./loop-detection";
 
 export interface PromptResult {
 	text: string;
@@ -39,6 +40,23 @@ Sigue estos pasos en orden para CADA problema:
 4. **Investigación**: Usa web search con Context7 y Tavily/Brave para documentación actualizada de librerías/APIs.
 5. **Solución Atómica**: Cambio quirúrgico, mínimo, que resuelve la causa raíz sin efectos secundarios.
 
+## Loop Detection & Auto-Correction
+
+Debes auto-monitorearte para detectar loops. Un loop = misma herramienta con mismos argumentos ≥3 veces seguidas SIN progreso hacia el objetivo.
+
+### Protocolo de Loop
+
+1. **Al detectar un loop (1ra vez)**: Di "EN_LOOP:1" y cambia de estrategia IMMEDIATAMENTE. No sigas haciendo lo mismo.
+2. **Si la nueva estrategia también loopa (2da vez)**: Di "EN_LOOP:2" y vuelve a cambiar. Es tu ÚLTIMA autosolución.
+3. **Si aún así loopas (3ra vez)**: Di "ESCALANDO" seguido de 2-3 frases explicando el problema al usuario. Espera instrucciones.
+
+### Estrategias para Romper Loops
+
+- Cambia de herramienta (si usaste bash, prueba web search)
+- Descompón el problema en sub-pasos más pequeños
+- Intenta un enfoque completamente diferente
+- Si es un error de API, prueba con parámetros diferentes
+
 ## Estilo de Código
 
 - **DRY**: No repitas lógica. Abstrae solo cuando se repite 3+ veces.
@@ -58,6 +76,9 @@ You are responding via Telegram messenger. Follow these rules:
 - **No disclaimers**: No "let me know if you need anything else", "hope this helps", etc.
 - **One message**: Send complete result in single message unless >4000 chars.`;
 }
+
+/** Severity of detected loop */
+type LoopSeverity = "ok" | "loop" | "escalate";
 
 /**
  * Wraps pi-247 AgentSession with Promise-based prompt/response API.
@@ -105,7 +126,6 @@ export class AgentClient {
 
 		const preview = text.length > 80 ? text.slice(0, 80) + "..." : text;
 
-		// If already processing a message, queue and return a promise
 		if (this.processing) {
 			if (this.queue.length >= MAX_QUEUE_SIZE) {
 				const err = new Error(`Queue full (max ${MAX_QUEUE_SIZE}). Try again later.`);
@@ -133,35 +153,58 @@ export class AgentClient {
 		}
 	}
 
-	private async runPrompt(text: string): Promise<PromptResult> {
-		const session = this.session!;
+	/**
+	 * Monitor a single turn cycle via subscription. Returns the assistant text
+	 * and detected loop severity from tool call patterns.
+	 */
+	private waitForTurn(session: AgentSession, turnPrompt: string): Promise<{
+		text: string;
+		partial: boolean;
+		loopSeverity: LoopSeverity;
+		toolCallHistory: string;
+	}> {
+		const toolCalls: Array<{ tool: string; key: string }> = [];
 
-		return new Promise<PromptResult>((resolve, reject) => {
+		return new Promise((resolve, reject) => {
 			const parts: string[] = [];
 			let partial = false;
 			let toolUsePending = false;
 			let settled = false;
+			let loopSeverity: LoopSeverity = "ok";
+			let turnData: {
+				text: string;
+				partial: boolean;
+				loopSeverity: LoopSeverity;
+				toolCallHistory: string;
+			} | null = null;
+			let promptDone = false;
 
 			const timer = setTimeout(() => {
 				settled = true;
 				reject(new Error(`Prompt timed out after ${PROMPT_TIMEOUT_MS / 1000}s`));
 			}, PROMPT_TIMEOUT_MS);
 
+			function finalize() {
+				if (!turnData || !promptDone) return;
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				unsubscribe();
+				resolve(turnData);
+			}
+
 			const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 				if (settled) return;
-				debug("agent", "EVENT: type=%s", event.type);
 
 				if (event.type === "message_update" && "assistantMessageEvent" in event) {
 					const ev = event as { assistantMessageEvent?: { type?: string; delta?: string } };
 					if (ev.assistantMessageEvent?.type === "text_delta" && ev.assistantMessageEvent.delta) {
 						parts.push(ev.assistantMessageEvent.delta);
-						debug("agent", "  text_delta: +%d chars", ev.assistantMessageEvent.delta.length);
 					}
 				}
 
 				if (event.type === "message_end") {
 					const msg = (event as { message?: { role?: string; content?: Array<{ type: string; text: string }>; stopReason?: string } }).message;
-					debug("agent", "  message_end role=%s stopReason=%s", msg?.role, (msg as any)?.stopReason);
 					if (msg?.role === "assistant") {
 						if (msg.content && Array.isArray(msg.content)) {
 							const fullText = msg.content
@@ -176,28 +219,47 @@ export class AgentClient {
 						if (msg.stopReason === "error" || msg.stopReason === "aborted") {
 							partial = true;
 						}
-						if (msg.stopReason === "toolUse") {
+						if (msg.stopReason === "toolUse" && msg.content) {
 							toolUsePending = true;
-							debug("agent", "  toolUse detected, deferring resolve");
+							// Track which tools are called for loop detection
+							for (const block of msg.content as Array<Record<string, unknown>>) {
+								const tu = block.toolUse as { name?: string; arguments?: Record<string, unknown> } | undefined;
+								if (tu?.name) {
+									const toolName = tu.name;
+									const argsKey = stableStringify(tu.arguments ?? {});
+									toolCalls.push({ tool: toolName, key: argsKey });
+
+									const detection = detectToolLoop(toolCalls);
+									if (detection.isLoop) {
+										loopSeverity = "loop";
+										debug("loop", "tool loop: %s(%s)", toolName, argsKey);
+									}
+								}
+							}
 						}
 					}
 				}
 
 				if (event.type === "turn_end") {
 					if (toolUsePending) {
-						debug("agent", "  turn_end after toolUse, waiting for next turn");
 						toolUsePending = false;
 						return;
 					}
-					const totalLen = parts.join("").length;
-					debug("agent", "TURN_END: response=%d chars partial=%s", totalLen, partial);
-					clearTimeout(timer);
-					unsubscribe();
-					resolve({ text: parts.join("").trim(), partial });
+					const toolCallHistory = toolCalls.map(t => `${t.tool}(${t.key})`).join(" | ");
+					turnData = {
+						text: parts.join("").trim(),
+						partial,
+						loopSeverity,
+						toolCallHistory,
+					};
+					finalize();
 				}
 			});
 
-			session.prompt(text).catch((err: unknown) => {
+			session.prompt(turnPrompt).then(() => {
+				promptDone = true;
+				finalize();
+			}).catch((err: unknown) => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
@@ -205,6 +267,50 @@ export class AgentClient {
 				reject(err);
 			});
 		});
+	}
+
+	private async runPrompt(text: string): Promise<PromptResult> {
+		const session = this.session!;
+		let combinedText = "";
+		let loopCount = 0;
+		const MAX_GATEWAY_INTERVENTIONS = 2;
+		let currentText = text;
+
+		for (let attempt = 0; attempt <= MAX_GATEWAY_INTERVENTIONS; attempt++) {
+			const result = await this.waitForTurn(session, currentText);
+			combinedText += (combinedText ? "\n\n" : "") + result.text;
+
+			if (result.loopSeverity === "ok" || attempt >= MAX_GATEWAY_INTERVENTIONS) {
+				return {
+					text: combinedText,
+					partial: result.partial,
+				};
+			}
+
+			// Gateway detected a loop — intervene with followUp
+			loopCount++;
+			log("loop", "intervening #%d after detecting tool repetition", loopCount);
+
+			// Check if agent already self-reported EN_LOOP or ESCALANDO
+			if (/ESCALANDO/i.test(result.text)) {
+				log("loop", "agent already escalated, not re-intervening");
+				return { text: combinedText, partial: false };
+			}
+			if (/EN_LOOP:\d/i.test(result.text)) {
+				log("loop", "agent self-corrected, waiting for next turn");
+				// Let the self-correction happen — fall through to send followUp
+			}
+
+			// Send corrective follow-up as a synthetic "user" message
+			const strategies = [
+				"[SISTEMA: Estas repitiendo la misma herramienta. Cambia de estrategia IMMEDIATAMENTE. Prueba otro enfoque completamente diferente.]",
+				"[SISTEMA: Sigue en loop. Es tu ULTIMA oportunidad de auto-correccion. Si no puedes resolverlo, di ESCALANDO y explica el problema.]",
+			];
+			const instruction = strategies[Math.min(attempt, strategies.length - 1)];
+			currentText = instruction;
+		}
+
+		return { text: combinedText, partial: false };
 	}
 
 	private dequeue(): void {
