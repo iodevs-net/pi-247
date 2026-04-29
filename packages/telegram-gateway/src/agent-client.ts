@@ -1,8 +1,9 @@
 import path from "path";
-import { createAgentSession, SessionManager, type AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent";
+import { createAgentSession, Settings, SessionManager, type AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent";
 import { debug, log } from "./debug";
 import { detectToolLoop, stableStringify } from "./loop-detection";
 import { hasVerificationEvidence } from "./evidence";
+import { checkContextPressure } from "./context-guard";
 
 export interface PromptResult {
 	text: string;
@@ -126,6 +127,10 @@ export class AgentClient {
 			opts.sessionManager = await SessionManager.continueRecent(cwd, sessionDir);
 		}
 		opts.systemPrompt = buildSystemPrompt(cwd);
+
+		const settings = await Settings.init({ cwd, agentDir: agentDir ?? undefined });
+		settings.override("compaction.thresholdPercent", 50);
+		opts.settings = settings;
 
 		const result = await createAgentSession(opts as Parameters<typeof createAgentSession>[0]);
 		this.session = result.session;
@@ -300,8 +305,25 @@ export class AgentClient {
 		let currentText = text;
 
 		for (let attempt = 0; attempt <= MAX_GATEWAY_INTERVENTIONS; attempt++) {
+			// Phase 0: Pre-turn context check (inspired by Rooster's pre_request_check)
+			const preUsage = session.getContextUsage();
+			if (preUsage?.percent != null) {
+				const action = checkContextPressure(preUsage.percent);
+				if (action === "compact") {
+					log("context", "CRITICAL %d%% — forcing pre-prompt compaction", preUsage.percent);
+					await session.compact("Gateway: pre-prompt compaction at critical threshold").catch(() => {});
+				} else if (action === "warn") {
+					log("context", "WARNING %d%% — monitoring", preUsage.percent);
+				}
+			}
+
 			const result = await this.waitForTurn(session, currentText);
 			combinedText += (combinedText ? "\n\n" : "") + result.text;
+
+			const postUsage = session.getContextUsage();
+			if (postUsage?.percent != null) {
+				debug("context", "post-turn: %d%% (%d/%d)", postUsage.percent, postUsage.tokens ?? 0, postUsage.contextWindow);
+			}
 
 			// 1. Loop detection intervention
 			if (result.loopSeverity === "loop" && attempt < MAX_GATEWAY_INTERVENTIONS) {
