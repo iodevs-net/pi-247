@@ -46,7 +46,7 @@ export class AgentClient {
 
 		const opts: Record<string, unknown> = { cwd };
 		if (sessionDir) {
-			opts.sessionManager = SessionManager.create(cwd, sessionDir);
+			opts.sessionManager = await SessionManager.continueRecent(cwd, sessionDir);
 		}
 		opts.systemPrompt = (defaultPrompt: string) => defaultPrompt + TELEGRAM_SYSTEM_PROMPT_SUFFIX;
 
