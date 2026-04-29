@@ -2,6 +2,7 @@ import path from "path";
 import { createAgentSession, SessionManager, type AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent";
 import { debug, log } from "./debug";
 import { detectToolLoop, stableStringify } from "./loop-detection";
+import { hasVerificationEvidence } from "./evidence";
 
 export interface PromptResult {
 	text: string;
@@ -56,6 +57,25 @@ Debes auto-monitorearte para detectar loops. Un loop = misma herramienta con mis
 - Descompón el problema en sub-pasos más pequeños
 - Intenta un enfoque completamente diferente
 - Si es un error de API, prueba con parámetros diferentes
+
+## Verification Gate Protocol (OBLIGATORIO)
+
+Antes de declarar una tarea como completa DEBES verificar.
+
+### Cuándo verificar
+
+- Si ejecutaste herramientas que modifican archivos (Write, Edit, Bash con sed/echo >, etc.) → verificacion OBLIGATORIA.
+- Si solo leiste o respondiste sin cambios → responde "NO_VERIFICADO: sin cambios".
+
+### Protocolo
+
+1. **LEE** el diff de tus cambios: \`git diff\` o revisa los archivos modificados.
+2. **TESTEA**: Corre tests o validacion relevante (typecheck, build, linter).
+3. **DECLARA** al FINAL de tu respuesta, en linea separada:
+   - \`VERIFICADO: [que se verifico] → [resultado]\`
+   - \`NO_VERIFICADO: [que no se pudo verificar]. RIESGO: [impacto potencial]\`
+
+Sin declaracion de verificacion la tarea NO esta completa. El gateway reintentara automaticamente.
 
 ## Estilo de Código
 
@@ -162,6 +182,7 @@ export class AgentClient {
 		partial: boolean;
 		loopSeverity: LoopSeverity;
 		toolCallHistory: string;
+		toolCallEntries: Array<{ tool: string; key: string }>;
 	}> {
 		const toolCalls: Array<{ tool: string; key: string }> = [];
 
@@ -176,6 +197,7 @@ export class AgentClient {
 				partial: boolean;
 				loopSeverity: LoopSeverity;
 				toolCallHistory: string;
+				toolCallEntries: Array<{ tool: string; key: string }>;
 			} | null = null;
 			let promptDone = false;
 
@@ -251,6 +273,7 @@ export class AgentClient {
 						partial,
 						loopSeverity,
 						toolCallHistory,
+						toolCallEntries: [...toolCalls],
 					};
 					finalize();
 				}
@@ -273,41 +296,58 @@ export class AgentClient {
 		const session = this.session!;
 		let combinedText = "";
 		let loopCount = 0;
-		const MAX_GATEWAY_INTERVENTIONS = 2;
+		const MAX_GATEWAY_INTERVENTIONS = 4;
 		let currentText = text;
 
 		for (let attempt = 0; attempt <= MAX_GATEWAY_INTERVENTIONS; attempt++) {
 			const result = await this.waitForTurn(session, currentText);
 			combinedText += (combinedText ? "\n\n" : "") + result.text;
 
-			if (result.loopSeverity === "ok" || attempt >= MAX_GATEWAY_INTERVENTIONS) {
-				return {
-					text: combinedText,
-					partial: result.partial,
-				};
+			// 1. Loop detection intervention
+			if (result.loopSeverity === "loop" && attempt < MAX_GATEWAY_INTERVENTIONS) {
+				loopCount++;
+				log("loop", "intervening #%d after detecting tool repetition", loopCount);
+
+				if (/ESCALANDO/i.test(result.text)) {
+					log("loop", "agent already escalated, not re-intervening");
+					return { text: combinedText, partial: false };
+				}
+
+				const strategies = [
+					"[SISTEMA: Estas repitiendo la misma herramienta. Cambia de estrategia IMMEDIATAMENTE. Prueba otro enfoque completamente diferente.]",
+					"[SISTEMA: Sigue en loop. Es tu ULTIMA oportunidad de auto-correccion. Si no puedes resolverlo, di ESCALANDO y explica el problema.]",
+				];
+				currentText = strategies[Math.min(loopCount - 1, strategies.length - 1)];
+				continue;
 			}
 
-			// Gateway detected a loop — intervene with followUp
-			loopCount++;
-			log("loop", "intervening #%d after detecting tool repetition", loopCount);
+			// 2. Verification Gate
+			if (result.toolCallEntries.length > 0 && attempt < MAX_GATEWAY_INTERVENTIONS) {
+				const isVerified = /\bVERIFICADO\b/.test(result.text);
+				const isNoVerified = /\bNO_VERIFICADO\b/.test(result.text);
 
-			// Check if agent already self-reported EN_LOOP or ESCALANDO
-			if (/ESCALANDO/i.test(result.text)) {
-				log("loop", "agent already escalated, not re-intervening");
-				return { text: combinedText, partial: false };
-			}
-			if (/EN_LOOP:\d/i.test(result.text)) {
-				log("loop", "agent self-corrected, waiting for next turn");
-				// Let the self-correction happen — fall through to send followUp
+				if (isNoVerified) {
+					// Honest declaration — no evidence needed
+					return { text: combinedText, partial: result.partial };
+				}
+
+				if (isVerified) {
+					// Check for real evidence in response
+					if (hasVerificationEvidence(result.text)) {
+						return { text: combinedText, partial: result.partial };
+					}
+					log("gate", "VERIFICADO without evidence, intervening (attempt %d)", attempt);
+					currentText = "[SISTEMA: Declaraste VERIFICADO pero no hay evidencia de verificacion (output de test/diff/build). Ejecuta el comando correspondiente y muestra el output REAL.]";
+					continue;
+				}
+
+				// No verification declaration at all
+				log("gate", "missing verification declaration, intervening (attempt %d)", attempt);
+				currentText = "[SISTEMA: No se detecto declaracion VERIFICADO/NO_VERIFICADO. Ejecuta el protocolo Verification Gate obligatorio.]";
+				continue;
 			}
 
-			// Send corrective follow-up as a synthetic "user" message
-			const strategies = [
-				"[SISTEMA: Estas repitiendo la misma herramienta. Cambia de estrategia IMMEDIATAMENTE. Prueba otro enfoque completamente diferente.]",
-				"[SISTEMA: Sigue en loop. Es tu ULTIMA oportunidad de auto-correccion. Si no puedes resolverlo, di ESCALANDO y explica el problema.]",
-			];
-			const instruction = strategies[Math.min(attempt, strategies.length - 1)];
-			currentText = instruction;
+			return { text: combinedText, partial: result.partial };
 		}
 
 		return { text: combinedText, partial: false };
