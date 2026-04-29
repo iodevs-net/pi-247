@@ -1,5 +1,6 @@
 import path from "path";
 import os from "os";
+import fs from "fs";
 
 export interface GatewayConfig {
 	telegramToken: string;
@@ -9,6 +10,28 @@ export interface GatewayConfig {
 	sessionDir: string | null;
 	/** Agent config dir (~/.omp/agent by default). Isolated from omp/Claude Code. */
 	agentDir: string;
+}
+
+/**
+ * Walk up from cwd to find project root (dir with package.json containing "workspaces").
+ */
+function findProjectRoot(start: string): string {
+	let dir = path.resolve(start);
+	for (let i = 0; i < 10; i++) {
+		const pkgPath = path.join(dir, "package.json");
+		try {
+			const content = fs.readFileSync(pkgPath, "utf-8");
+			if (content.includes('"workspaces"') || content.includes('"workspaces":')) {
+				return dir;
+			}
+		} catch {
+			// not found, continue up
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return start;
 }
 
 function isPlaceholderToken(token: string): boolean {
@@ -56,11 +79,12 @@ export function loadConfig(): GatewayConfig {
 	const allowedUsers = allowedRaw === "*" ? ["*"] : allowedRaw.split(",").map(s => s.trim()).filter(Boolean);
 
 	const defaultAgentDir = path.join(os.homedir(), ".omp", "pi-gateway");
+	const defaultCwd = findProjectRoot(process.cwd());
 
 	return {
 		telegramToken: tgToken,
 		allowedUsers,
-		agentCwd: process.env.GATEWAY_AGENT_CWD ?? process.cwd(),
+		agentCwd: process.env.GATEWAY_AGENT_CWD ?? defaultCwd,
 		sessionDir: process.env.GATEWAY_SESSION_DIR ?? null,
 		agentDir: process.env.GATEWAY_AGENT_DIR ?? defaultAgentDir,
 	};

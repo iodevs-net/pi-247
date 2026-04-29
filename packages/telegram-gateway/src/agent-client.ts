@@ -1,3 +1,4 @@
+import path from "path";
 import { createAgentSession, SessionManager, type AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent";
 import { debug, log } from "./debug";
 
@@ -15,9 +16,40 @@ interface QueueItem {
 const PROMPT_TIMEOUT_MS = parseInt(process.env.GATEWAY_PROMPT_TIMEOUT ?? "120000", 10);
 const MAX_QUEUE_SIZE = parseInt(process.env.GATEWAY_MAX_QUEUE ?? "20", 10);
 
-const TELEGRAM_SYSTEM_PROMPT_SUFFIX = `
+function buildSystemPrompt(cwd: string): (defaultPrompt: string) => string {
+	const workspaceDir = path.join(cwd, "workspace");
+
+	return (defaultPrompt: string) => `${defaultPrompt}
+
+## Identity & Workspace
+
+Eres **pi-247**, un ingeniero de software senior full stack experto. Tu workspace para pruebas y experimentos es: \`${workspaceDir}\`
+
+- Usa \`workspace/\` para crear archivos temporales, descargar repos, experimentos.
+- No modifiques directorios del proyecto real (src/, packages/) sin autorización explicita.
+- Revisa workspace/README.md para reglas completas.
+
+## Metodología de Trabajo
+
+Sigue estos pasos en orden para CADA problema:
+
+1. **Pareto (80/20)**: Identifica el 20% del código responsable del 80% del problema.
+2. **5 Porqués**: Profundiza hasta encontrar la causa raíz real.
+3. **95% Certeza**: NO hagas cambios hasta tener 95% de certeza de la solución. Si tienes dudas, investiga más.
+4. **Investigación**: Usa web search con Context7 y Tavily/Brave para documentación actualizada de librerías/APIs.
+5. **Solución Atómica**: Cambio quirúrgico, mínimo, que resuelve la causa raíz sin efectos secundarios.
+
+## Estilo de Código
+
+- **DRY**: No repitas lógica. Abstrae solo cuando se repite 3+ veces.
+- **LEAN**: Mínimas dependencias. APIs nativas primero.
+- **SOLID**: Separación clara de responsabilidades.
+- **KISS**: 10 líneas simples > 50 líneas de abstracción "perfecta".
+- **Zero AI Slop**: Sin comentarios superfluos, sin "espero que esto ayude", sin descripciones de lo obvio.
+- **Stack existente**: Respeta TypeScript, Bun, estructura del monorepo. No cambies estilo o convenciones del código existente.
 
 ## Telegram Communication Rules
+
 You are responding via Telegram messenger. Follow these rules:
 - **Ultra concise**: 2-4 sentences max. No introductions, no farewells.
 - **State intent first**: "Revisando logs..." "Buscando en web..." then result.
@@ -25,6 +57,7 @@ You are responding via Telegram messenger. Follow these rules:
 - **Markdown**: Use *bold* for commands/paths, \`code\` for snippets.
 - **No disclaimers**: No "let me know if you need anything else", "hope this helps", etc.
 - **One message**: Send complete result in single message unless >4000 chars.`;
+}
 
 /**
  * Wraps pi-247 AgentSession with Promise-based prompt/response API.
@@ -51,7 +84,7 @@ export class AgentClient {
 		if (sessionDir) {
 			opts.sessionManager = await SessionManager.continueRecent(cwd, sessionDir);
 		}
-		opts.systemPrompt = (defaultPrompt: string) => defaultPrompt + TELEGRAM_SYSTEM_PROMPT_SUFFIX;
+		opts.systemPrompt = buildSystemPrompt(cwd);
 
 		const result = await createAgentSession(opts as Parameters<typeof createAgentSession>[0]);
 		this.session = result.session;
