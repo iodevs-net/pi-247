@@ -94,6 +94,7 @@ export class AgentClient {
 		return new Promise((resolve, reject) => {
 			const parts: string[] = [];
 			let partial = false;
+			let toolUsePending = false;
 
 			const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 				debug("agent", "EVENT: type=%s", event.type);
@@ -123,10 +124,19 @@ export class AgentClient {
 						if (msg.stopReason === "error" || msg.stopReason === "aborted") {
 							partial = true;
 						}
+						if (msg.stopReason === "toolUse") {
+							toolUsePending = true;
+							debug("agent", "  toolUse detected, deferring resolve");
+						}
 					}
 				}
 
 				if (event.type === "turn_end") {
+					if (toolUsePending) {
+						debug("agent", "  turn_end after toolUse, waiting for next turn");
+						toolUsePending = false;
+						return;
+					}
 					const totalLen = parts.join("").length;
 					debug("agent", "TURN_END: response=%d chars partial=%s", totalLen, partial);
 					unsubscribe();
