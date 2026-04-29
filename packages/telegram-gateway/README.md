@@ -20,7 +20,6 @@ bun packages/telegram-gateway/src/index.ts
 | `GATEWAY_ALLOWED_USERS` | No | `*` | Comma-separated Telegram user IDs |
 | `GATEWAY_AGENT_CWD` | No | `cwd` | Working directory for pi-247 |
 | `GATEWAY_SESSION_DIR` | No | auto | Session persistence directory |
-| `GATEWAY_MAX_TURNS` | No | `30` | Max prompt/response cycles before session auto-reset |
 
 ### Email (optional)
 
