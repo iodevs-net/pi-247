@@ -53,3 +53,26 @@ Each message goes through the same agent pipeline as a terminal session — bash
 - **Shared session**: Maintains conversation context across messages.
 - **Full tool access**: The agent can run bash commands, edit files, browse web, etc.
 - **Message splitting**: Long responses split into multiple Telegram messages (4096 char limit).
+- **Session persistence**: Uses `SessionManager.continueRecent()` so conversation survives process restarts.
+
+## Production Deployment (systemd)
+
+```bash
+# 1. Create env file
+sudo mkdir -p /etc/pi-247
+sudo tee /etc/pi-247/gateway.env <<'EOF'
+TELEGRAM_BOT_TOKEN=your_token
+GATEWAY_ALLOWED_USERS=your_user_id
+GATEWAY_AGENT_CWD=/opt/pi-247
+GATEWAY_SESSION_DIR=/opt/pi-247/.omp/sessions
+EOF
+
+# 2. Install service
+sudo cp pi-247-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-247-gateway
+
+# 3. Check status
+sudo systemctl status pi-247-gateway
+journalctl -u pi-247-gateway -f
+```

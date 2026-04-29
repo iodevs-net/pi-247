@@ -1,0 +1,21 @@
+[Unit]
+Description=pi-247 Telegram + Email Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/pi-247
+ExecStart=/usr/bin/bun run packages/telegram-gateway/src/index.ts
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=-/etc/pi-247/gateway.env
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/pi-247
+
+[Install]
+WantedBy=multi-user.target
