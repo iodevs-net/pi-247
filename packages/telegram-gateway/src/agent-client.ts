@@ -14,6 +14,7 @@ interface QueueItem {
 
 const PROMPT_TIMEOUT_MS = parseInt(process.env.GATEWAY_PROMPT_TIMEOUT ?? "120000", 10);
 const MAX_QUEUE_SIZE = parseInt(process.env.GATEWAY_MAX_QUEUE ?? "20", 10);
+const MAX_TURNS = parseInt(process.env.GATEWAY_MAX_TURNS ?? "30", 10);
 
 const TELEGRAM_SYSTEM_PROMPT_SUFFIX = `
 
@@ -35,6 +36,7 @@ export class AgentClient {
 	private processing = false;
 	private queue: QueueItem[] = [];
 	private idleWaiters: Array<() => void> = [];
+	private turnCount = 0;
 
 	get isBusy(): boolean {
 		return this.processing;
@@ -89,9 +91,15 @@ export class AgentClient {
 	private async executePrompt(text: string): Promise<PromptResult> {
 		this.processing = true;
 		try {
+			if (this.turnCount >= MAX_TURNS) {
+				this.turnCount = 0;
+				await this.session!.prompt("/reset");
+				log("agent", "auto-reset after %d turns", MAX_TURNS);
+			}
 			return await this.runPrompt(text);
 		} finally {
 			this.processing = false;
+			this.turnCount++;
 			this.notifyIdleWaiters();
 			this.dequeue();
 		}
