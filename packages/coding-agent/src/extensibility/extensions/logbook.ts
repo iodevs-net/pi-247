@@ -20,6 +20,7 @@ const LOGBOOK_TOOL = "logbook";
 const MAX_FILE_BYTES = 100_000;
 const MAX_ENTRY_BYTES = 5_000;
 const MAX_INJECTION_CHARS = 3_000;
+const NUDGE_INTERVAL = 10;
 const ALLOWED_TYPES = ["Fixed", "Changed", "Ongoing", "Decided", "Added", "Removed"];
 
 interface LogbookEntry {
@@ -149,6 +150,7 @@ function formatForInjection(data: LogbookData): string {
 	}
 	if (parts.length === 1) return "";
 	parts.push("</logbook>");
+	parts.push("<!-- record cross-session notes: logbook append -->");
 	return parts.join("\n");
 }
 
@@ -360,14 +362,26 @@ export default function (pi: ExtensionAPI) {
 
 	// ─── Inject logbook summary before each agent loop ────────────────────
 
+	let turnCount = 0;
+
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const filePath = logbookPath(ctx.cwd);
 		try {
 			const data = await readLogbook(filePath);
 			if (data.entries.length === 0) return;
 
-			const injection = formatForInjection(data);
+			let injection = formatForInjection(data);
 			if (!injection) return;
+
+			turnCount++;
+			if (turnCount > 0 && turnCount % NUDGE_INTERVAL === 0) {
+				injection +=
+					"\n<logbook-nudge>\n" +
+					"Consider saving noteworthy findings, decisions, or fixes using\n" +
+					"logbook append (type: Fixed|Changed|Ongoing|Decided|Added|Removed).\n" +
+					"This preserves context across sessions and compactions.\n" +
+					"</logbook-nudge>";
+			}
 
 			return {
 				message: {
