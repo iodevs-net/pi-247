@@ -47,6 +47,17 @@ export class TelegramBot {
 			await ctx.reply(`pi-247 gateway. Agent: ${s}.`);
 		});
 
+		this.bot.command("stop", async ctx => {
+			log("telegram", "/stop from user=%s", ctx.from?.username ?? ctx.from?.id ?? "?");
+			if (!this.agent.isBusy) {
+				await ctx.reply("Agent is not busy.");
+				return;
+			}
+			await ctx.reply("⏹ Stopping...");
+			await this.agent.stop();
+			await ctx.reply("✅ Stopped. Ready for next message.");
+		});
+
 		this.bot.on("message:text", async ctx => {
 			if (!isAllowed(ctx, this.config.allowedUsers)) return;
 			const text = ctx.message.text.trim();

@@ -19,6 +19,7 @@ import type { CustomMessage } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 import { resolvePath } from "../utils";
+import logbookExtension from "./logbook";
 import reliabilityExtension from "./reliability";
 import type {
 	Extension,
@@ -31,7 +32,6 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types";
-import verificationExtension from "./verification";
 import workingMemoryExtension from "./working-memory";
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
@@ -531,15 +531,11 @@ export async function discoverAndLoadExtensions(
 		"core-working-memory",
 	);
 	extensions.unshift(workingMemory);
-	// 5. Inject verification extension
-	const verification = await loadExtensionFromFactory(
-		verificationExtension,
-		cwd,
-		resolvedEventBus,
-		runtime,
-		"core-verification",
-	);
-	extensions.unshift(verification);
+
+	// 5. Inject core logbook extension (cross-session persistent memory)
+	const logbook = await loadExtensionFromFactory(logbookExtension, cwd, resolvedEventBus, runtime, "core-logbook");
+	extensions.unshift(logbook);
+
 	// 6. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {
 		const resolved = resolvePath(configuredPath, cwd);

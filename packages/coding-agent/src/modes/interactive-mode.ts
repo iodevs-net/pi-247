@@ -34,7 +34,7 @@ import planModeApprovedPrompt from "../prompts/system/plan-mode-approved.md" wit
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
-import { getRecentSessions } from "../session/session-manager";
+import { getRecentSessions } from "../session";
 import { STTController, type SttState } from "../stt";
 import type { ExitPlanModeDetails, LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";

@@ -9,7 +9,8 @@
  *   5. Generic Anthropic fallback (ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL)
  */
 import { $env, getAgentDbPath } from "@oh-my-pi/pi-utils";
-import { type AuthCredential, AuthCredentialStore } from "../auth-storage";
+import { type AuthCredential } from "../auth-types";
+import { AuthCredentialStore } from "../auth-credential-store";
 import {
 	buildAnthropicHeaders as buildProviderAnthropicHeaders,
 	normalizeAnthropicBaseUrl,

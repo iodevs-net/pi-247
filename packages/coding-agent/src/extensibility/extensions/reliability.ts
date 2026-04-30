@@ -2,88 +2,124 @@ import { hasVerificationEvidence } from "../../utils/evidence";
 import { detectToolLoop, stableStringify, type ToolCallEntry } from "../../utils/loop-detection";
 import type { ExtensionAPI, ExtensionContext } from "./types";
 
+// -- Low-level helpers -----------------------------------------------------------
+
+function extractText(message: {
+	role?: string;
+	content?: Array<{ type: string; text?: string }>;
+}): string {
+	return message.content
+		?.filter(c => c.type === "text")
+		.map(c => c.text ?? "")
+		.join("") ?? "";
+}
+
+function extractFilePath(toolName: string, args: unknown): string | undefined {
+	if (!args || typeof args !== "object") return undefined;
+	const typedArgs = args as Record<string, unknown>;
+	switch (toolName) {
+		case "edit":
+		case "write":
+		case "ast_edit":
+			return typedArgs.path as string;
+		default:
+			return undefined;
+	}
+}
+
+function getVerificationSuggestion(): string {
+	return "bun test || bun check || npm test || yarn test";
+}
+
+const COMPLETION_CLAIM = /\b(done|completed|finished|fixed|solved|resolved)\b/i;
+const COMPLETION_PHRASE = /\b(all\s+done|task\s+complete|is\s+(?:now\s+)?(?:fixed|working|complete))\b/i;
+const COMPLETION_ES = /\b(verificad[ao]s?|listo|terminado|resuelto)\b/i;
+
+function hasCompletionClaim(text: string): boolean {
+	return COMPLETION_CLAIM.test(text) || COMPLETION_PHRASE.test(text) || COMPLETION_ES.test(text);
+}
+
+// -- Exported subsystems ---------------------------------------------------------
+
+export interface MutationTracker {
+	loopHistory: ToolCallEntry[];
+	mutatedFiles: Set<string>;
+}
+
 /**
- * Reliability Extension
- *
- * Implements core safety protocols for p247:
- * 1. Verification Gate: Ensures evidence check after code mutations.
- * 2. Anti-Loop Protocol: Detects and breaks tool-call cycles.
- *
- * Note: Context compaction is handled by AgentSession's auto-compaction system,
- * which runs post-turn with proper retry, multi-model fallback, and pruning.
- * Running compaction in turn_start (as the old Context Guard did) blocked the
- * agent mid-turn and caused disruptive interruptions.
+ * Track tool calls and file mutations from tool_execution_start events.
  */
-export default function (pi: ExtensionAPI) {
+export function createMutationTracker(pi: ExtensionAPI): MutationTracker {
 	const loopHistory: ToolCallEntry[] = [];
-	let _loopCount = 0;
-	const _MAX_INTERVENTIONS = 4;
-	let _hasUnverifiedMutations = false;
+	const mutatedFiles = new Set<string>();
 	const MUTATING_TOOLS = new Set(["edit", "write", "ast_edit"]);
 
-	// Track tool calls for loop detection AND mutation tracking
 	pi.on("tool_execution_start", async event => {
 		const args = event.args ?? {};
-		let key: string;
-		if (typeof args === "string") {
-			key = args;
-		} else if (args && typeof args === "object") {
-			key = stableStringify(args);
-		} else {
-			key = String(args);
-		}
+		const key = typeof args === "string" ? args : typeof args === "object" && args ? stableStringify(args) : String(args);
 		loopHistory.push({ tool: event.toolName, key });
+
 		if (MUTATING_TOOLS.has(event.toolName)) {
-			_hasUnverifiedMutations = true;
-			pi.logger.debug("Verification Gate: Mutation detected via %s. Flagging as unverified.", event.toolName);
+			const filePath = extractFilePath(event.toolName, args);
+			if (filePath) mutatedFiles.add(filePath);
+			pi.logger.debug("Verification: Tracking mutation of %s", filePath ?? event.toolName);
 		}
 	});
 
-	// Anti-Loop & Verification Gate (Post-turn check)
-	pi.on("turn_end", async (event, _ctx: ExtensionContext) => {
-		const { message } = event;
-		if (message.role !== "assistant") return;
-		const assistantText =
-			message.content
-				?.filter(c => c.type === "text")
-				.map(c => (c as { text: string }).text)
-				.join("") ?? "";
+	return { loopHistory, mutatedFiles };
+}
 
-		// --- Anti-Loop Logic ---
-		const loopDetection = detectToolLoop(loopHistory);
-		if (loopDetection.isLoop && _loopCount < _MAX_INTERVENTIONS) {
-			_loopCount++;
-			if (/ESCALANDO/i.test(assistantText)) return;
-			const strategies = [
-				"[SISTEMA: Estas repitiendo la misma herramienta. Cambia de estrategia IMMEDIATAMENTE. Prueba otro enfoque completamente diferente.]",
-				"[SISTEMA: Sigue en loop. Es tu ULTIMA oportunidad de auto-correccion. Si no puedes resolverlo, di ESCALANDO y explica el problema.]",
-			];
-			pi.sendMessage(
-				{
-					customType: "system_intervention",
-					content: [{ type: "text", text: strategies[Math.min(_loopCount - 1, strategies.length - 1)] }],
-					display: "none",
-				},
-				{ triggerTurn: true },
-			);
-			return;
+/**
+ * Detect tool-call repetition and send escalating system interventions.
+ * Returns true if intervention was sent (caller should skip further processing).
+ */
+export function createAntiLoopGuard(pi: ExtensionAPI, loopHistory: ToolCallEntry[]) {
+	let loopCount = 0;
+	const MAX_INTERVENTIONS = 4;
+
+	return function checkLoop(assistantText: string): boolean {
+		const detection = detectToolLoop(loopHistory);
+		if (!detection.isLoop || loopCount >= MAX_INTERVENTIONS) return false;
+
+		if (/ESCALANDO/i.test(assistantText)) {
+			pi.logger.debug("Anti-Loop: Agent escalated, not intervening.");
+			return false;
 		}
 
-		// --- Verification Gate Logic ---
-		// Only activate after code mutations — skip pure read-only turns entirely
-		if (!_hasUnverifiedMutations) return;
-		// Check for real verification evidence in this turn (test output, diff, build)
+		loopCount++;
+		const strategies = [
+			"[SISTEMA: Estas repitiendo la misma herramienta. Cambia de estrategia IMMEDIATAMENTE. Prueba otro enfoque completamente diferente.]",
+			"[SISTEMA: Sigue en loop. Es tu ULTIMA oportunidad de auto-correccion. Si no puedes resolverlo, di ESCALANDO y explica el problema.]",
+		];
+		pi.sendMessage(
+			{
+				customType: "system_intervention",
+				content: [{ type: "text", text: strategies[Math.min(loopCount - 1, strategies.length - 1)] }],
+				display: "none",
+			},
+			{ triggerTurn: true },
+		);
+		return true;
+	};
+}
+
+/**
+ * Verify that code changes include real evidence (test output, diff, build).
+ * Returns true if intervention was sent.
+ */
+export function createVerificationGate(pi: ExtensionAPI, mutatedFiles: Set<string>) {
+	return function checkVerification(assistantText: string): boolean {
+		if (mutatedFiles.size === 0) return false;
+
+		// Real evidence — clear and pass
 		if (hasVerificationEvidence(assistantText)) {
-			_hasUnverifiedMutations = false;
-			pi.logger.debug("Verification Gate: Evidence detected. Clearing mutation flag.");
-			return;
+			mutatedFiles.clear();
+			pi.logger.debug("Verification Gate: Evidence detected. Clearing mutation tracking.");
+			return false;
 		}
 
-		const isVerified = /\bVERIFICADO\b/.test(assistantText);
-		const isNoVerified = /\bNO_VERIFICADO\b/.test(assistantText);
-
-		// Explicit VERIFICADO — but where's the evidence?
-		if (isVerified) {
+		// VERIFICADO declared but no evidence
+		if (/\bVERIFICADO\b/.test(assistantText)) {
 			pi.sendMessage(
 				{
 					customType: "system_intervention",
@@ -97,45 +133,64 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ triggerTurn: true },
 			);
-			return;
+			return true;
 		}
 
-		// Honest NO_VERIFICADO — let it pass but keep flag active
-		if (isNoVerified) {
-			pi.logger.debug("Verification Gate: NO_VERIFICADO declared. Flag remains active.");
-			return;
+		// Honest NO_VERIFICADO — pass without clearing
+		if (/\bNO_VERIFICADO\b/.test(assistantText)) {
+			pi.logger.debug("Verification Gate: NO_VERIFICADO declared. Mutations remain tracked.");
+			return false;
 		}
 
-		// Completion claim after mutation — this is the critical catch
-		const hasCompletionClaim =
-			/\b(done|completed|finished|fixed|solved|resolved)\b/i.test(assistantText) ||
-			/\b(all\s+done|task\s+complete|is\s+(?:now\s+)?(?:fixed|working|complete))\b/i.test(assistantText) ||
-			/\b(verificad[ao]s?|listo|terminado|resuelto)\b/i.test(assistantText);
-		if (hasCompletionClaim) {
+		// Completion claim after mutation — catch incomplete verification
+		if (hasCompletionClaim(assistantText)) {
 			pi.sendMessage(
 				{
 					customType: "system_intervention",
 					content: [
 						{
 							type: "text",
-							text: "[SISTEMA: Modificaste archivos y declaraste completado sin verificacion real. Ejecuta bun test / bun check / git diff y muestra el output REAL, o declara NO_VERIFICADO si no verificaste.]",
+							text: `[SISTEMA: Modificaste ${mutatedFiles.size} archivo(s) y declaraste completado sin verificacion real. Ejecuta ${getVerificationSuggestion()} y muestra el output REAL, o declara NO_VERIFICADO si no verificaste.]`,
 						},
 					],
 					display: "none",
 				},
 				{ triggerTurn: true },
 			);
-			return;
+			return true;
 		}
 
-		// Mutation happened but agent is still working — no intervention, just log
-		pi.logger.debug("Verification Gate: Unverified mutations pending. Agent still working, no intervention.");
+		// Still working — no intervention
+		pi.logger.debug("Verification: Mutations pending verification. Files: %o", Array.from(mutatedFiles));
+		return false;
+	};
+}
+
+// -- Extension orchestrator ------------------------------------------------------
+
+/**
+ * Reliability Extension
+ *
+ * Core safety protocols for p247:
+ * 1. Verification Gate — evidence check after code mutations.
+ * 2. Anti-Loop Protocol — detect and break tool-call cycles.
+ */
+export default function (pi: ExtensionAPI) {
+	const { loopHistory, mutatedFiles } = createMutationTracker(pi);
+	const checkLoop = createAntiLoopGuard(pi, loopHistory);
+	const checkVerification = createVerificationGate(pi, mutatedFiles);
+
+	pi.on("turn_end", async (event, _ctx: ExtensionContext) => {
+		const { message } = event;
+		if (message.role !== "assistant") return;
+
+		const assistantText = extractText(message);
+		if (checkLoop(assistantText)) return;
+		checkVerification(assistantText);
 	});
 
-	// Reset all state on new agent start
 	pi.on("agent_start", () => {
 		loopHistory.length = 0;
-		_loopCount = 0;
-		_hasUnverifiedMutations = false;
+		mutatedFiles.clear();
 	});
 }

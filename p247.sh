@@ -6,4 +6,4 @@
 SCRIPT="$(readlink -f "$0")"
 DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
 cd "$DIR" || exit 1
-exec bun run packages/telegram-gateway/src/cli.ts "$@"
+exec bun run packages/coding-agent/src/cli.ts "$@"

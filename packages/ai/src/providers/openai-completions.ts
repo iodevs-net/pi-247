@@ -890,7 +890,13 @@ function buildParams(
 		params.tool_choice = mapToOpenAICompletionsToolChoice(options.toolChoice);
 	}
 
-	if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
+	if (supportsReasoningParams && compat.thinkingFormat === "deepseek" && model.reasoning) {
+		// DeepSeek V4 requiere ambos: thinking param + reasoning_effort
+		Reflect.set(params, "thinking", { type: options?.reasoning ? "enabled" : "disabled" });
+		if (options?.reasoning) {
+			Reflect.set(params, "reasoning_effort", mapReasoningEffort(options.reasoning, compat.reasoningEffortMap));
+		}
+	} else if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
 		// Z.ai uses binary thinking: { type: "enabled" | "disabled" }
 		// Must explicitly disable since z.ai defaults to thinking enabled
 		Reflect.set(params, "thinking", { type: options?.reasoning ? "enabled" : "disabled" });

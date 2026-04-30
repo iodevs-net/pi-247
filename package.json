@@ -79,6 +79,8 @@
 		"ajv": "8.20.0"
 	},
 	"scripts": {
+		"gateway": "bun --env-file=.env packages/telegram-gateway/src/index.ts",
+		"gateway:debug": "DEBUG=true bun --env-file=.env packages/telegram-gateway/src/index.ts",
 		"install:dev": "bun install && bun --cwd=packages/coding-agent link && bun --cwd=packages/ai link",
 		"dev": "bun --cwd=packages/coding-agent src/cli.ts",
 		"stats": "bun --cwd=packages/coding-agent src/cli.ts stats",

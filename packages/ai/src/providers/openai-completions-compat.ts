@@ -54,6 +54,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 	const isKimiModel = model.id.includes("moonshotai/kimi") || /^kimi[-.]/i.test(model.id);
 	const isAlibaba = provider === "alibaba-coding-plan" || baseUrl.includes("dashscope");
 	const isQwen = model.id.toLowerCase().includes("qwen");
+	const isDeepSeek = provider === "deepseek" || baseUrl.includes("api.deepseek.com") || baseUrl.includes("deepseek.com");
 
 	const isNonStandard =
 		isCerebras ||
@@ -102,13 +103,15 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		requiresAssistantAfterToolResult: false,
 		requiresThinkingAsText: isMistral,
 		requiresMistralToolIds: isMistral,
-		thinkingFormat: isZai
-			? "zai"
-			: provider === "openrouter" || baseUrl.includes("openrouter.ai")
-				? "openrouter"
-				: isAlibaba || isQwen
-					? "qwen"
-					: "openai",
+		thinkingFormat: isDeepSeek
+			? "deepseek"
+			: isZai
+				? "zai"
+				: provider === "openrouter" || baseUrl.includes("openrouter.ai")
+					? "openrouter"
+					: isAlibaba || isQwen
+						? "qwen"
+						: "openai",
 		reasoningContentField: "reasoning_content",
 		// Backends that 400 follow-up requests when prior assistant tool-call turns lack `reasoning_content`:
 		//   - Kimi: documented invariant on its native API and via OpenCode-Go.
@@ -118,12 +121,12 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		//     rely on a placeholder — see `convertMessages` for the placeholder injection.
 		requiresReasoningContentForToolCalls:
 			isKimiModel ||
-			(provider === "deepseek" && Boolean(model.reasoning)) ||
+			(isDeepSeek && Boolean(model.reasoning)) ||
 			((provider === "openrouter" || baseUrl.includes("openrouter.ai")) && Boolean(model.reasoning)),
 		requiresAssistantContentForToolCalls: isKimiModel,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,
-		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
+		supportsStrictMode: isDeepSeek ? false : detectStrictModeSupport(provider, baseUrl),
 		extraBody: undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
 	};

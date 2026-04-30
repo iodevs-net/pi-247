@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import * as readline from "node:readline";
-import { AuthCredentialStore } from "./auth-storage";
+import { AuthCredentialStore } from "./auth-credential-store";
 import { getOAuthProviders } from "./utils/oauth";
 import { loginAnthropic } from "./utils/oauth/anthropic";
 import { loginCursor } from "./utils/oauth/cursor";
