@@ -6,6 +6,7 @@ import {
 	type AgentSession,
 	type AgentSessionEvent,
 } from "@oh-my-pi/pi-coding-agent";
+import { Effort } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { debug, log } from "./debug";
 import { detectToolLoop, stableStringify } from "@oh-my-pi/pi-coding-agent/utils/loop-detection";
@@ -79,43 +80,68 @@ export class AgentClient {
 		}
 		// Always persist sessions — derive default from agentDir if not configured
 		const resolvedDir = sessionDir ?? (agentDir ? path.join(agentDir, "sessions") : undefined);
-		opts.sessionManager = await SessionManager.continueRecent(cwd, resolvedDir);
+		
 		opts.systemPrompt = buildSystemPrompt(cwd);
 
 		const settings = await Settings.init({ cwd, agentDir: agentDir ?? undefined });
 		settings.override("compaction.thresholdPercent", 50);
 		opts.settings = settings;
 
-		// If ANTHROPIC_MODEL + ANTHROPIC_BASE_URL point to a non-Anthropic endpoint,
-		// inject a custom model so the agent actually uses the configured provider.
-		const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL?.trim();
-		const anthropicModel = process.env.ANTHROPIC_MODEL?.trim();
-		if (
-			anthropicBaseUrl &&
-			anthropicModel &&
-			!anthropicBaseUrl.includes("api.anthropic.com") &&
-			!anthropicBaseUrl.includes("api.anthropic.com")
-		) {
-			opts.model = {
-				id: anthropicModel,
-				name: anthropicModel,
-				api: "anthropic-messages",
-				provider: "anthropic",
-				baseUrl: anthropicBaseUrl,
+		// Provider selection: GATEWAY_LLM_PROVIDER=deepseek (default) | openrouter
+		// Env keys come from process env (systemd or .env).
+		let model: Model | undefined;
+		const gatewayProvider = process.env.GATEWAY_LLM_PROVIDER?.trim().toLowerCase();
+
+		if (gatewayProvider === "openrouter") {
+			const orModel = process.env.GATEWAY_OPENROUTER_MODEL?.trim() || "openrouter/auto";
+			model = {
+				id: orModel,
+				name: orModel,
+				api: "openai-completions",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
 				reasoning: true,
 				input: ["text"],
 				cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 },
-				contextWindow: 65536,
+				contextWindow: 128000,
 				maxTokens: 8192,
 				headers: {},
-				thinking: {
-					minLevel: "minimal" as const,
-					maxLevel: "xhigh" as const,
-					mode: "budget" as const,
-				},
 			} satisfies Model;
-			log("agent", "custom model injected: %s via %s", anthropicModel, anthropicBaseUrl);
+			log("agent", "OpenRouter model injected: %s", orModel);
+		} else {
+			// Default: DeepSeek via Anthropic-compatible endpoint
+			const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL?.trim();
+			const anthropicModel = process.env.ANTHROPIC_MODEL?.trim();
+			if (
+				anthropicBaseUrl &&
+				anthropicModel &&
+				!anthropicBaseUrl.includes("api.anthropic.com")
+			) {
+				model = {
+					id: anthropicModel,
+					name: anthropicModel,
+					api: "anthropic-messages",
+					provider: "anthropic",
+					baseUrl: anthropicBaseUrl,
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0.15 },
+					contextWindow: 65536,
+					maxTokens: 8192,
+					headers: {},
+					thinking: {
+						minLevel: Effort.Minimal,
+						maxLevel: Effort.XHigh,
+						mode: "budget" as const,
+					},
+				} satisfies Model;
+				log("agent", "DeepSeek model injected: %s via %s", anthropicModel, anthropicBaseUrl);
+			}
 		}
+
+		const sessionManager = await SessionManager.continueRecent(cwd, resolvedDir);
+		opts.model = model;
+		opts.sessionManager = sessionManager;
 
 		const result = await createAgentSession(opts as Parameters<typeof createAgentSession>[0]);
 		this.session = result.session;
@@ -124,6 +150,8 @@ export class AgentClient {
 			console.warn("[agent] %s", result.modelFallbackMessage);
 		}
 
+		// If old session has mismatched thinking blocks, first prompt may 400.
+		// Catch, reset, retry once.
 		console.log("[agent] session ready");
 	}
 
@@ -156,7 +184,19 @@ export class AgentClient {
 		this.processing = true;
 		this.#currentAbort = new AbortController();
 		try {
-			return await this.runPrompt(text, this.#currentAbort.signal);
+			return await this.runPrompt(text, this.#currentAbort.signal, false);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			// If old session has thinking blocks that DeepSeek rejects, reset & retry once
+			if (msg.includes("content[].thinking") || msg.includes("must be passed back")) {
+				log("agent", "thinking block 400 — resetting session & retrying");
+				try {
+					await this.session?.prompt("/reset").catch(() => {});
+				} catch {}
+				this.#currentAbort = new AbortController();
+				return await this.runPrompt(text, this.#currentAbort.signal, true);
+			}
+			throw err;
 		} finally {
 			this.#currentAbort = null;
 			this.processing = false;
@@ -221,6 +261,8 @@ export class AgentClient {
 		const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
 			if (resolved) return;
 
+			debug("agent", "session event: %s", event.type);
+
 			// Accumulate streaming text deltas
 			if (event.type === "message_update" && "assistantMessageEvent" in event) {
 				const ev = event as { assistantMessageEvent?: { type?: string; delta?: string } };
@@ -234,6 +276,8 @@ export class AgentClient {
 					message?: { role?: string; content?: Array<{ type: string; text: string }>; stopReason?: string };
 				}).message;
 				if (msg?.role !== "assistant") return;
+				debug("agent", "msg_end stopReason=%s textLen=%d", msg.stopReason ?? "?", msg.content?.length ?? 0);
+				if (msg.stopReason === "error" || msg.stopReason === "aborted") debug("agent", "ERROR msg: %s", JSON.stringify(msg).slice(0,500));
 
 				// Replace incremental deltas with final message text
 				if (msg.content && Array.isArray(msg.content)) {
@@ -294,11 +338,12 @@ export class AgentClient {
 		return promise;
 	}
 
-	private async runPrompt(text: string, signal?: AbortSignal): Promise<PromptResult> {
+	private async runPrompt(text: string, signal?: AbortSignal, wasRetried?: boolean): Promise<PromptResult> {
 		const session = this.session!;
 		let combinedText = "";
 		let loopCount = 0;
 		let currentText = text;
+		if (wasRetried) debug("agent", "retrying after 400 reset");
 
 		for (let attempt = 0; attempt <= 4; attempt++) {
 			// Pre-turn context check
