@@ -1,3 +1,6 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 import type { ExtensionAPI, ExtensionContext } from "./types";
 
 /**
@@ -17,21 +20,46 @@ import type { ExtensionAPI, ExtensionContext } from "./types";
  */
 
 const WORKING_MEMORY_ENTRY = "working_memory";
+const LOGBOOK_FILE = ".p247/logbook.md";
+const MAX_LOGBOOK_ENTRIES = 5;
 
 interface WorkingMemoryData {
 	sections: Record<string, string>;
+}
+
+interface LogbookEntry {
+	date: string;
+	type: string;
+	title: string;
 }
 
 function emptyData(): WorkingMemoryData {
 	return { sections: {} };
 }
 
-function formatForInjection(data: WorkingMemoryData): string {
+function escapeXml(s: string): string {
+	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function formatForInjection(data: WorkingMemoryData, logbookEntries: LogbookEntry[]): string {
 	const keys = Object.keys(data.sections);
-	if (keys.length === 0) return "";
+	const hasSections = keys.length > 0;
+	const hasLogbook = logbookEntries.length > 0;
+	if (!hasSections && !hasLogbook) return "";
+
 	const parts: string[] = ["<working-memory>"];
-	for (const key of keys.sort()) {
-		parts.push(`  <${key}>`, `    ${data.sections[key]}`, `  </${key}>`);
+	if (hasSections) {
+		for (const key of keys.sort()) {
+			parts.push(`  <${key}>`, `    ${data.sections[key]}`, `  </${key}>`);
+		}
+	}
+	if (hasLogbook) {
+		parts.push("  <logbook-readonly>");
+		for (const entry of logbookEntries) {
+			const title = entry.title.length > 80 ? entry.title.slice(0, 77) + "..." : entry.title;
+			parts.push(`    <entry date="${entry.date}" type="${entry.type.toLowerCase()}">${escapeXml(title)}</entry>`);
+		}
+		parts.push("  </logbook-readonly>");
 	}
 	parts.push("</working-memory>");
 	return parts.join("\n");
@@ -55,6 +83,50 @@ function findLatestMemory(ctx: ExtensionContext): WorkingMemoryData {
 		}
 	}
 	return emptyData();
+}
+
+function parseLogbookEntries(content: string): LogbookEntry[] {
+	const entries: LogbookEntry[] = [];
+	const dayRegex = /^##\s+(\d{4}-\d{2}-\d{2})\s*$/gm;
+	const dayPositions: { date: string; start: number; end: number }[] = [];
+
+	let dayMatch: RegExpExecArray | null;
+	while ((dayMatch = dayRegex.exec(content)) !== null) {
+		const start = dayMatch.index;
+		const date = dayMatch[1];
+		if (dayPositions.length > 0) {
+			dayPositions[dayPositions.length - 1].end = start;
+		}
+		dayPositions.push({ date, start, end: content.length });
+	}
+
+	for (const day of dayPositions) {
+		if (entries.length >= MAX_LOGBOOK_ENTRIES) break;
+		const section = content.slice(day.start, day.end);
+		const entryRegex = /^###\s+(Fixed|Changed|Ongoing|Decided|Added|Removed):\s+(.+)$/gm;
+		let entryMatch: RegExpExecArray | null;
+		while ((entryMatch = entryRegex.exec(section)) !== null) {
+			if (entries.length >= MAX_LOGBOOK_ENTRIES) break;
+			entries.push({
+				date: day.date,
+				type: entryMatch[1],
+				title: entryMatch[2].trim(),
+			});
+		}
+	}
+
+	return entries;
+}
+
+async function readRecentLogbookEntries(cwd: string): Promise<LogbookEntry[]> {
+	const filePath = path.join(cwd, LOGBOOK_FILE);
+	try {
+		const content = await fs.readFile(filePath, "utf-8");
+		return parseLogbookEntries(content);
+	} catch (err) {
+		if (isEnoent(err)) return [];
+		throw err;
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -154,15 +226,27 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --- Inject working memory before each agent loop ---
-	pi.on("before_agent_start", (_event, ctx) => {
+	pi.on("before_agent_start", async (_event, ctx) => {
 		// Hydrate from session on first call
 		if (!current) {
 			current = findLatestMemory(ctx);
 		}
 
-		if (!current || Object.keys(current.sections).length === 0) return;
+		// Read recent logbook entries from disk
+		let logbookEntries: LogbookEntry[] = [];
+		try {
+			logbookEntries = await readRecentLogbookEntries(ctx.cwd);
+		} catch (err) {
+			pi.logger.warn("Working memory: failed to read logbook for injection", {
+				error: String(err),
+			});
+		}
 
-		const injection = formatForInjection(current);
+		// Format with current sections + logbook entries
+		const injection = formatForInjection(
+			current ?? emptyData(),
+			logbookEntries,
+		);
 		if (!injection) return;
 
 		return {
