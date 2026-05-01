@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI } from "./types";
 
 /**
@@ -22,6 +23,13 @@ const MAX_ENTRY_BYTES = 5_000;
 const MAX_INJECTION_CHARS = 3_000;
 const NUDGE_INTERVAL = 10;
 const ALLOWED_TYPES = ["Fixed", "Changed", "Ongoing", "Decided", "Added", "Removed"];
+const MAX_AUTO_ENTRIES = 5;
+const AUTO_PATTERNS: Array<{ re: RegExp; type: string }> = [
+	{ re: /(?:arreglé|corregí|solucioné|fixe(?:é|e)|resolví)/i, type: "Fixed" },
+	{ re: /(?:root cause|causa raíz|encontré el bug|diagnóstico|la raíz)/i, type: "Fixed" },
+	{ re: /(?:decidí|opté por|voy a adoptar|approach será)/i, type: "Decided" },
+	{ re: /(?:cambié|cambiamos|refactor(?:icé|ic))(?:\s|$)/i, type: "Changed" },
+];
 
 interface LogbookEntry {
 	date: string;
@@ -202,6 +210,40 @@ function isValidDate(s: string): boolean {
 	return /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
 
+// ─── Auto-recording helpers ────────────────────────────────────────────
+
+async function appendEntry(cwd: string, entry: LogbookEntry): Promise<number> {
+	await ensureP247Dir(cwd);
+	const filePath = logbookPath(cwd);
+	const unlock = await acquireLock(cwd);
+	try {
+		const data = await readLogbook(filePath);
+		data.entries.unshift(entry);
+		data.entries = truncateEntries(data.entries);
+		await writeLogbookAtomic(filePath, data.entries);
+		return data.entries.length;
+	} finally {
+		unlock();
+	}
+}
+
+function extractTextContent(
+	content: Array<{ type: string; text?: string }> | string | undefined,
+): string {
+	if (!content) return "";
+	if (typeof content === "string") return content;
+	return content
+		.filter(c => c.type === "text" && c.text)
+		.map(c => c.text!)
+		.join("\n");
+}
+
+function extractSurroundingSentence(text: string, index: number): string {
+	const start = Math.max(0, text.lastIndexOf(".", index - 1) + 1);
+	const end = text.indexOf(".", index);
+	return text.slice(start, end >= 0 ? end + 1 : undefined).trim();
+}
+
 // ─── Extension factory ──────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -303,18 +345,7 @@ export default function (pi: ExtensionAPI) {
 					body: params.body.trim(),
 				};
 
-				await ensureP247Dir(ctx.cwd);
-				const unlock = await acquireLock(ctx.cwd);
-				let entryCount = 0;
-				try {
-					const data = await readLogbook(filePath);
-					data.entries.unshift(newEntry);
-					data.entries = truncateEntries(data.entries);
-					await writeLogbookAtomic(filePath, data.entries);
-					entryCount = data.entries.length;
-				} finally {
-					unlock();
-				}
+				const entryCount = await appendEntry(ctx.cwd, newEntry);
 
 				return {
 					content: [{ type: "text" as const, text: `Entry added. ${entryCount} total entries.` }],
@@ -363,6 +394,7 @@ export default function (pi: ExtensionAPI) {
 	// ─── Inject logbook summary before each agent loop ────────────────────
 
 	let turnCount = 0;
+	let lastNudgeTurn = 0;
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const filePath = logbookPath(ctx.cwd);
@@ -396,4 +428,91 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 	});
+
+	// ─── Active nudge: next-turn message without triggerTurn ────────
+
+	pi.on("agent_end", () => {
+		turnCount++;
+		if (turnCount - lastNudgeTurn >= NUDGE_INTERVAL) {
+			lastNudgeTurn = turnCount;
+			pi.sendMessage(
+				{
+					customType: "logbook_nudge",
+					content: [
+						{
+							type: "text" as const,
+							text:
+								"<logbook-nudge>\n" +
+								"Save noteworthy findings using logbook append.\n" +
+								"Types: Fixed, Changed, Ongoing, Decided, Added, Removed.\n" +
+								"One concise entry per session is enough.\n" +
+								"</logbook-nudge>",
+						},
+					],
+					display: false,
+				},
+				// No triggerTurn — nested agent.prompt() leaks events into
+				// external subscribers (Telegram gateway). Auto-recording
+				// + passive nudge cover persistence without forced turns.
+				{ deliverAs: "nextTurn" },
+			);
+		}
+	});
+
+		// ─── Auto-recording: tool errors + decision detection ────────────
+
+		let autoEntryCount = 0;
+		let recordedErrorKeys = new Set<string>();
+
+		pi.on("turn_end", async (event, ctx) => {
+			if (autoEntryCount >= MAX_AUTO_ENTRIES) return;
+
+			// 1. Auto-record tool errors
+			for (const tr of event.toolResults) {
+				if (!tr.isError) continue;
+				const errorText = extractTextContent(tr.content);
+				if (!errorText) continue;
+				const errorKey = tr.toolName + ":" + errorText.slice(0, 120);
+				if (recordedErrorKeys.has(errorKey)) continue;
+				recordedErrorKeys.add(errorKey);
+
+				const firstLine = errorText.split("\n")[0].slice(0, 80);
+				await appendEntry(ctx.cwd, {
+					date: new Date().toISOString().slice(0, 10),
+					type: "Ongoing",
+					title: "Error in " + tr.toolName + ": " + firstLine,
+					body: errorText.slice(0, 500),
+				});
+				autoEntryCount++;
+				if (autoEntryCount >= MAX_AUTO_ENTRIES) return;
+			}
+
+			// 2. Detect decisions/arreglos in assistant text
+			// turn_end always carries the assistant's response
+			const msg = event.message as { content: AssistantMessage["content"] };
+			const text = extractTextContent(msg.content);
+			if (!text) return;
+
+			for (const { re, type } of AUTO_PATTERNS) {
+				const match = text.match(re);
+				if (!match) continue;
+
+				const sentence = extractSurroundingSentence(text, match.index!);
+				if (sentence.length < 20) continue;
+
+				const key = "dec:" + sentence.slice(0, 100);
+				if (recordedErrorKeys.has(key)) continue;
+				recordedErrorKeys.add(key);
+
+				await appendEntry(ctx.cwd, {
+					date: new Date().toISOString().slice(0, 10),
+					type,
+					title: sentence.slice(0, 80),
+					body: sentence.slice(0, 500),
+				});
+				autoEntryCount++;
+				if (autoEntryCount >= MAX_AUTO_ENTRIES) return;
+			}
+		});
+
 }
